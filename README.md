@@ -7,7 +7,7 @@
 
   <h1>gh-org-guard</h1>
 
-  <p><strong>Org-wide GitHub rulesets and a required security scan that block malware, hidden code and supply-chain attacks before they reach <code>main</code>.</strong></p>
+  <p><strong>GitHub org rulesets, a required security scan and an AI-agent PR skill, built from real attacks on dev teams: fake fonts, auto-run VS Code tasks and poisoned configs.</strong></p>
 
   ![License](https://img.shields.io/github/license/yousuf-git/gh-org-guard?style=flat-square)
   ![Last commit](https://img.shields.io/github/last-commit/yousuf-git/gh-org-guard?style=flat-square)

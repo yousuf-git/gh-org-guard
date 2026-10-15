@@ -125,7 +125,7 @@ Run locally against branches of the sandbox target repo:
 - `yarn npm audit` (Yarn Berry) in CI.
 - The preflight's `yara`, `clamav` and `gitleaks` steps on a developer machine. Those tools weren't installed where the skill was tested, and the script skips them when they're missing. The same rules ran in CI.
 - Whether @mentioned owners received the email or web notification. The issue text and mentions were verified; delivery wasn't.
-- `npx skills add` against this public repo. The layout (`skills/<name>/SKILL.md`) follows the CLI's documented discovery rules.
+- A full `npx skills add … -g` install into each agent. `npx skills add yousuf-git/gh-org-guard --list` was run against the published repo and found `create-pr-guarded`; the install step itself wasn't run.
 
 ## Changes since the live tests
 
@@ -135,4 +135,4 @@ For the public release, the rules and checkers were made org-neutral. The change
 - the submodule check reads the org from `GITHUB_REPOSITORY_OWNER` instead of a hardcoded name;
 - the registry User-Agent renamed.
 
-The offline suite covers all of these, but the renamed workflow hasn't been re-run on a live org.
+The offline suite covers all of these. It passed in the repo's `self-test` workflow on 2026-10-15, YARA cases included. The renamed scan workflow hasn't been re-run on a live org.
