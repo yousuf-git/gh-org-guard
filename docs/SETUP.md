@@ -105,7 +105,7 @@ If a repo has no `CODEOWNERS`, Ruleset A's *Require review from Code Owners* has
       "include": ["~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master"],
       "exclude": []
     },
-    "repository_name": { "include": ["~ALL"], "exclude": [], "protected": true }
+    "repository_name": { "include": ["~ALL"], "exclude": [], "protected": false }
   },
   "rules": [
     { "type": "deletion" },

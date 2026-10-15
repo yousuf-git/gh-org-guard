@@ -11,7 +11,7 @@
     "repository_name": {
       "include": ["~ALL"],
       "exclude": ["security-workflows"],
-      "protected": true
+      "protected": false
     }
   },
   "rules": [
