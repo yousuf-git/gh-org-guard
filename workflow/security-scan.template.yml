@@ -1,0 +1,256 @@
+name: security-scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+
+jobs:
+  # One job instead of six: GitHub bills every job rounded up to a whole minute.
+  scan:
+    name: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      failed: ${{ steps.result.outputs.failed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install ClamAV and YARA
+        id: install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav yara
+          sudo systemctl stop clamav-freshclam || true
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore ClamAV signatures
+        id: clamdb
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ steps.install.outputs.day }}
+          restore-keys: clamav-db-
+      - name: Update ClamAV signatures
+        run: |
+          mkdir -p "$HOME/clamav-db"
+          sudo cp -r "$HOME/clamav-db/." /var/lib/clamav/
+          sudo chown -R clamav:clamav /var/lib/clamav
+          sudo freshclam --quiet
+          rm -rf "$HOME/clamav-db" && mkdir "$HOME/clamav-db"
+          sudo cp /var/lib/clamav/* "$HOME/clamav-db/"
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/clamav-db"
+      - name: Save ClamAV signatures
+        if: steps.clamdb.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ steps.install.outputs.day }}
+      - name: Install Gitleaks (checksum-verified)
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "linux_x64.tar.gz" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+      - name: Write YARA rules
+        run: |
+          cat > "$RUNNER_TEMP/guard.yar" <<'YARA'
+@@YARA@@
+          YARA
+      - name: Write policy checker
+        run: |
+          cat > "$RUNNER_TEMP/repo_policy.py" <<'PY'
+@@REPO_POLICY@@
+          PY
+      - name: Write dependency policy checker
+        run: |
+          cat > "$RUNNER_TEMP/deps_policy.py" <<'PY'
+@@DEPS_POLICY@@
+          PY
+
+      # Every check runs even when an earlier one fails, so one run reports all findings.
+      - name: clamav
+        id: clamav
+        if: ${{ !cancelled() }}
+        run: clamscan --recursive --infected --exclude-dir='/\.git$' .
+      - name: yara
+        id: yara
+        if: ${{ !cancelled() }}
+        run: |
+          hits=$(yara --recursive --no-warnings "$RUNNER_TEMP/guard.yar" .)
+          if [ -n "$hits" ]; then
+            echo "::error::YARA rules matched suspicious code"
+            echo "$hits"
+            exit 1
+          fi
+      - name: gitleaks
+        id: gitleaks
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --log-opts="${BASE_SHA}..${HEAD_SHA}" \
+            --redact --no-banner --exit-code 1 --verbose .
+      - name: repo-policy
+        id: repo_policy
+        if: ${{ !cancelled() }}
+        run: python3 -I "$RUNNER_TEMP/repo_policy.py"
+      - name: ai-coauthor
+        id: ai_coauthor
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='(noreply@anthropic\.com|@anthropic\.com|claude code|claude (opus|sonnet|haiku|fable)|cursoragent|@cursor\.(com|sh)|copilot@users\.noreply\.github\.com|copilot-swe-agent|@openai\.com|chatgpt|openai codex|devin-ai-integration|aider@aider\.chat|codeium|windsurf|tabnine|gemini-code-assist|amazon q developer)'
+          bad=0
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            meta=$(git show -s --format='%an <%ae>%n%cn <%ce>%n%B' "$sha")
+            if hits=$(printf '%s\n' "$meta" | grep -inE "$pattern"); then
+              echo "::error::Commit $sha credits an AI tool:"
+              printf '%s\n' "$hits" | sed 's/^/    /'
+              bad=1
+            fi
+          done
+          exit "$bad"
+      # Last on purpose: package-manager audits may load repo-controlled config, so nothing else runs after them.
+      - name: dependency-audit
+        id: dependency_audit
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          fail=0
+          echo "::group::Lockfile integrity, install scripts, new-package vetting"
+          python3 -I "$RUNNER_TEMP/deps_policy.py" "$BASE_SHA" || fail=1
+          echo "::endgroup::"
+          for lock in $(git ls-files 'package-lock.json' '*/package-lock.json' 'yarn.lock' '*/yarn.lock' 'pnpm-lock.yaml' '*/pnpm-lock.yaml' | grep -v 'node_modules/'); do
+            dir=$(dirname "$lock")
+            case "$(basename "$lock")" in
+              package-lock.json)
+                all_critical="npm audit --audit-level=critical"
+                prod_high="npm audit --omit=dev --audit-level=high"
+                all_high="npm audit --audit-level=high" ;;
+              yarn.lock)
+                if grep -q '^__metadata:' "$lock"; then
+                  corepack enable
+                  all_critical="yarn npm audit --all --recursive --severity critical"
+                  prod_high="yarn npm audit --all --recursive --environment production --severity high"
+                  all_high="yarn npm audit --all --recursive --severity high"
+                else
+                  all_critical="npx --yes yarn@1.22.22 audit --level critical"
+                  prod_high="npx --yes yarn@1.22.22 audit --level high --groups dependencies"
+                  all_high="npx --yes yarn@1.22.22 audit --level high"
+                fi ;;
+              pnpm-lock.yaml)
+                all_critical="npx --yes pnpm@12.8.2 audit --audit-level critical"
+                prod_high="npx --yes pnpm@12.8.2 audit --prod --audit-level high"
+                all_high="npx --yes pnpm@12.8.2 audit --audit-level high" ;;
+            esac
+            echo "::group::$lock: critical advisories in any dependency (includes malware)"
+            (cd "$dir" && $all_critical) || { fail=1; echo "::error file=$lock::critical advisory (possibly malware) in a dependency"; }
+            echo "::endgroup::"
+            echo "::group::$lock: high advisories in production dependencies"
+            prod_ok=1
+            (cd "$dir" && $prod_high) || { fail=1; prod_ok=0; echo "::error file=$lock::high-severity advisory in a production dependency"; }
+            echo "::endgroup::"
+            if [ "$prod_ok" = 1 ] && ! (cd "$dir" && $all_high > /dev/null 2>&1); then
+              echo "::warning file=$lock::high-severity advisories in dev-only dependencies (not blocking); run the audit locally and upgrade"
+            fi
+          done
+          exit "$fail"
+
+      - name: Result
+        id: result
+        if: ${{ !cancelled() }}
+        env:
+          OUTCOMES: >-
+            clamav=${{ steps.clamav.outcome }}
+            yara=${{ steps.yara.outcome }}
+            gitleaks=${{ steps.gitleaks.outcome }}
+            repo-policy=${{ steps.repo_policy.outcome }}
+            ai-coauthor=${{ steps.ai_coauthor.outcome }}
+            dependency-audit=${{ steps.dependency_audit.outcome }}
+        run: |
+          failed=""
+          for pair in $OUTCOMES; do
+            [ "${pair#*=}" = success ] || failed="$failed,${pair%%=*}"
+          done
+          failed=${failed#,}
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::error::Failed checks: $failed"
+            exit 1
+          fi
+
+  report:
+    name: report
+    needs: scan
+    if: failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update a security issue tagging owner and author
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FAILED: ${{ needs.scan.outputs.failed }}
+          SECURITY_OWNER: ${{ vars.SECURITY_OWNER }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const label = 'security-scan';
+            const failed = (process.env.FAILED || '').split(',').filter(Boolean);
+            const owners = [...new Set((process.env.SECURITY_OWNER || '')
+              .split(/[\s,]+/)
+              .map((login) => login.replace(/^@/, '').toLowerCase())
+              .filter(Boolean))];
+            if (owners.length === 0) {
+              core.warning('Organization variable SECURITY_OWNER is not set; no security owner will be tagged.');
+            }
+            const tag = (login) => (login.endsWith('[bot]') ? login : `@${login}`);
+            const describe = (login) => `${tag(login)}${owners.includes(login.toLowerCase()) ? ' (also a security owner)' : ''}`;
+            const pushers = [...new Map([context.actor, pr.user.login].map((login) => [login.toLowerCase(), login])).values()];
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const title = `⚠️ Security scan failed on PR #${pr.number}`;
+            const body = [
+              `**Security owners:** ${owners.length ? owners.map(tag).join(' ') : '_not configured_'}`,
+              `**Pushed by:** ${describe(context.actor)}`,
+              ...(pushers.length > 1 ? [`**PR author:** ${describe(pr.user.login)}`] : []),
+              '',
+              `The required security scan blocked ${pr.html_url} at commit \`${pr.head.sha}\`.`,
+              '',
+              `**Failed checks:** ${failed.length ? failed.map((name) => `\`${name}\``).join(', ') : 'a setup step (see run logs)'}`,
+              `**Run logs:** ${runUrl}`,
+              '',
+              'The PR cannot merge until every check passes. If a finding is a false positive, the owner decides whether to adjust the rule; do not bypass the ruleset.',
+            ].join('\n');
+
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'b60205' });
+            } catch (error) {
+              if (error.status !== 422) throw error;
+            }
+
+            const open = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', labels: label });
+            const existing = open.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+            }

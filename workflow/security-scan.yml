@@ -1,0 +1,1410 @@
+name: security-scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+
+jobs:
+  # One job instead of six: GitHub bills every job rounded up to a whole minute.
+  scan:
+    name: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      failed: ${{ steps.result.outputs.failed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install ClamAV and YARA
+        id: install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav yara
+          sudo systemctl stop clamav-freshclam || true
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore ClamAV signatures
+        id: clamdb
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ steps.install.outputs.day }}
+          restore-keys: clamav-db-
+      - name: Update ClamAV signatures
+        run: |
+          mkdir -p "$HOME/clamav-db"
+          sudo cp -r "$HOME/clamav-db/." /var/lib/clamav/
+          sudo chown -R clamav:clamav /var/lib/clamav
+          sudo freshclam --quiet
+          rm -rf "$HOME/clamav-db" && mkdir "$HOME/clamav-db"
+          sudo cp /var/lib/clamav/* "$HOME/clamav-db/"
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/clamav-db"
+      - name: Save ClamAV signatures
+        if: steps.clamdb.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ steps.install.outputs.day }}
+      - name: Install Gitleaks (checksum-verified)
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "linux_x64.tar.gz" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+      - name: Write YARA rules
+        run: |
+          cat > "$RUNNER_TEMP/guard.yar" <<'YARA'
+          rule Guard_JS_Eval_Of_Decoded_Payload
+          {
+            meta:
+              description = "eval/Function/vm executing a base64-, hex- or charcode-decoded string"
+            strings:
+              $a = /\beval\s*\(\s*(atob|Buffer\.from|unescape|decodeURIComponent|String\.fromCharCode)\s*\(/
+              $b = /new\s+Function\s*\(\s*(atob|Buffer\.from|String\.fromCharCode)\s*\(/
+              $c = /vm\.runIn(New|This)?Context\s*\(\s*(atob|Buffer\.from)\s*\(/
+              $d = /Function\.constructor\s*\(/
+              $e = /unescape\s*\(\s*['"]%u[0-9a-fA-F]{4}%u/
+            condition:
+              any of them
+          }
+
+          rule Guard_JS_Eval_Of_Remote_Response
+          {
+            meta:
+              description = "code downloaded at runtime and executed (BeaverTail / loader pattern)"
+            strings:
+              $a = /(eval|new\s+Function|Function)\s*\(\s*[a-zA-Z_$][\w$]*\.(data|body|text)\b/
+              $b = /\.then\s*\(\s*(eval|Function)\s*\)/
+              $c = /new\s+Function\s*\(\s*['"]require['"]\s*,/
+            condition:
+              any of them
+          }
+
+          rule Guard_JS_Executes_Asset_File
+          {
+            meta:
+              description = "reads a font/image/asset file and executes or requires it as code"
+            strings:
+              $read = /(readFileSync|readFile|createReadStream)\s*\([^)]{0,200}\.(woff2?|ttf|otf|eot|png|jpe?g|gif|ico|svg|webp|mp3|mp4|pdf|txt|dat|bin)\b/
+              $req = /require\s*\(\s*['"`][^'"`]+\.(woff2?|ttf|otf|eot|png|jpe?g|gif|ico|webp|txt|dat|bin)['"`]\s*\)/
+              $exec1 = /\beval\s*\(/
+              $exec2 = /new\s+Function\b/
+              $exec3 = /vm\.(runIn|Script|compileFunction)/
+              $exec4 = "child_process"
+              $exec5 = /\bnode\s+[^\n'"]+\.(woff2?|ttf|otf|eot|png|jpe?g|gif|ico|svg|webp)\b/
+            condition:
+              ($read and any of ($exec1, $exec2, $exec3, $exec4)) or $exec5 or ($req and any of ($exec1, $exec2, $exec3, $exec4))
+          }
+
+          rule Guard_NPM_Install_Hook_Downloads_Code
+          {
+            meta:
+              description = "package.json lifecycle hook that fetches, pipes or evals code"
+            strings:
+              $hook = /"(pre|post)?(install|prepare|prepublish)"\s*:\s*"[^"]*(curl |wget |Invoke-WebRequest|iwr |powershell|node -e|node --eval|\| *(ba)?sh|base64)[^"]*"/
+            condition:
+              $hook
+          }
+
+          rule Guard_Remote_Script_Piped_To_Shell
+          {
+            meta:
+              description = "child_process running a downloaded script through a shell"
+            strings:
+              $cp = "child_process"
+              $pipe = /(curl|wget)[^\n'"`]{0,200}\|\s*(ba|z)?sh\b/
+            condition:
+              $cp and $pipe
+          }
+
+          rule Guard_Reverse_Shell
+          {
+            meta:
+              description = "reverse shell constructs"
+            strings:
+              $devtcp = /\/dev\/tcp\/[0-9a-zA-Z.\-]+\/[0-9]{2,5}/
+              $nc = /\bnc(at)?\s+(-[a-z]*e\s+\/bin\/(ba)?sh|[^\n]{0,80}-e\s+\/bin\/(ba)?sh)/
+              $bashi = /bash\s+-i\s*>&/
+              $socat = /socat\s+[^\n]{0,80}exec:/ nocase
+              $pysock = /python[0-9.]*\s+-c\s+['"][^'"]{0,200}import\s+socket/
+              $sock = "net.Socket"
+              $spawnsh = /spawn\s*\(\s*['"`](\/bin\/)?(ba)?sh['"`]/
+              $pipe = /\.pipe\s*\(\s*[a-zA-Z_$][\w$]*\.stdin\s*\)/
+            condition:
+              $devtcp or $nc or $bashi or $socat or $pysock or ($sock and ($spawnsh or $pipe))
+          }
+
+          rule Guard_Destructive_Command
+          {
+            meta:
+              description = "wipes disks, root, home, or forks the machine to death"
+            strings:
+              $rm = /rm\s+-(rf|fr|r\s+-f|f\s+-r|-recursive\s+--force)\s+(--no-preserve-root\s+)?["']?(\/\*?|~\/?\*?|\$HOME\/?\*?|\$\{HOME\}|\*)["']?(\s|$|;|&|\|)/
+              $npr = "--no-preserve-root"
+              $dd = /dd\s+if=[^\n]{0,80}of=\/dev\/(sd|nvme|hd|xvd|vd|disk)/
+              $mkfs = /\bmkfs(\.[a-z0-9]+)?\s+\/dev\//
+              $fork = /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/
+              $win1 = /(rd|rmdir|del)\s+\/s\s+\/q\s+[a-zA-Z]:\\/ nocase
+              $win2 = /Remove-Item\s+[^\n]{0,60}-Recurse[^\n]{0,30}-Force[^\n]{0,30}[a-zA-Z]:\\/ nocase
+              $win3 = /format\s+[a-zA-Z]:\s*\/[qy]/ nocase
+              $chmod = /chmod\s+-R\s+0?777\s+\/(\s|$)/
+              $jsrm = /(rmSync|rimraf(\.sync)?|removeSync|emptyDirSync)\s*\(\s*(os\.homedir\(\)|process\.env\.(HOME|USERPROFILE)|['"`](\/|~|[A-Za-z]:\\\\)['"`])/
+            condition:
+              any of them
+          }
+
+          rule Guard_Credential_Theft
+          {
+            meta:
+              description = "reads credential stores, browser profiles or crypto wallets"
+            strings:
+              $read = /(readFileSync|readFile|readdirSync|readdir|createReadStream|copyFileSync|copyFile|existsSync|globSync|fs\.promises)\b/
+              $p1 = /\.ssh\/(id_[a-z0-9]+|authorized_keys|known_hosts)/
+              $p2 = /\.aws\/credentials/
+              $p3 = /\.config\/gcloud/
+              $p4 = /\.kube\/config/
+              $p5 = /\.docker\/config\.json/
+              $p6 = /\.git-credentials/
+              $p7 = "Login Data"
+              $p8 = "Local State"
+              $p9 = /Local Extension Settings/
+              $p10 = "nkbihfbeogaeaoehlefnkodbefgpgknn"
+              $p11 = "bfnaelmomeimhlpmgjnjophhpkkoljpa"
+              $p12 = "ibnejdfjmmkpcnlpebklmnkoeoihofec"
+              $p13 = /\/etc\/(shadow|passwd)/
+              $p14 = /Library\/Keychains|login\.keychain/
+              $p15 = /\.mozilla\/firefox|Firefox\/Profiles/
+              $p16 = /(Google\/Chrome|BraveSoftware|Microsoft\/Edge)\/(User Data|Default)/
+              $p17 = /\.npmrc['"`]/
+              $p18 = /Exodus|Electrum|atomic\/Local Storage|solana\/id\.json/
+            condition:
+              $read and any of ($p*)
+          }
+
+          rule Guard_Persistence
+          {
+            meta:
+              description = "installs itself to run again: shell profiles, cron, services, autostart, registry"
+            strings:
+              $write = /(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|>>\s*~|>>\s*\$HOME|tee\s+-a)/
+              $t1 = /\.(bashrc|zshrc|bash_profile|profile|zprofile)\b/
+              $t2 = /authorized_keys/
+              $t3 = /\/etc\/(cron|sudoers|systemd|rc\.local|ld\.so\.preload)/
+              $t4 = /\.config\/(autostart|systemd\/user)/
+              $t5 = /Library\/LaunchAgents|Library\/LaunchDaemons/
+              $t6 = /Start Menu\\\\Programs\\\\Startup|AppData\\\\Roaming\\\\Microsoft\\\\Windows\\\\Start Menu/ nocase
+              $c1 = /crontab\s+(-l|-)/
+              $c2 = /schtasks\s+\/create/ nocase
+              $c3 = /reg\s+add\s+[^\n]{0,80}\\Run\b/ nocase
+              $c4 = /systemctl\s+(--user\s+)?enable/
+              $c5 = /code\s+--install-extension/
+              $c6 = /npm\s+(i|install)\s+(-g|--global)\b/
+            condition:
+              ($write and any of ($t*)) or any of ($c*)
+          }
+
+          rule Guard_Exfil_Webhook_Endpoint
+          {
+            meta:
+              description = "hardcoded Discord/Telegram endpoints commonly used for credential exfiltration"
+            strings:
+              $discord = /discord(app)?\.com\/api\/webhooks\/[0-9]{10,}/
+              $telegram = /api\.telegram\.org\/bot[0-9]{6,}:/
+            condition:
+              any of them
+          }
+
+          rule Guard_Crypto_Miner
+          {
+            meta:
+              description = "cryptocurrency miner indicators"
+            strings:
+              $s1 = "stratum+tcp://" nocase
+              $s2 = "stratum+ssl://" nocase
+              $s3 = "xmrig" nocase
+              $s4 = "coinhive" nocase
+              $s5 = "cryptonight" nocase
+              $s6 = "cpuminer" nocase
+              $s7 = /(nanopool|minexmr|supportxmr|hashvault|2miners|f2pool|nicehash)\.(org|com|pro|net)/ nocase
+            condition:
+              any of them
+          }
+
+          rule Guard_JS_Obfuscator_Output
+          {
+            meta:
+              description = "heavy javascript-obfuscator style _0x identifiers in a source file"
+            strings:
+              $hex = /_0x[a-f0-9]{4,6}/
+            condition:
+              #hex > 100
+          }
+
+          rule Guard_Anti_Analysis
+          {
+            meta:
+              description = "sandbox/VM/debugger evasion typical of malware droppers"
+            strings:
+              $vm1 = /(VBOX|VirtualBox|VMware|QEMU|Xen|sandbox)['"`][^\n]{0,80}(includes|indexOf|test|match)/ nocase
+              $vm2 = /(os\.cpus\(\)\.length\s*<\s*[1-3]\b|os\.totalmem\(\)\s*<)/
+              $dbg = /setInterval\s*\(\s*(function\s*\(\)\s*\{|\(\)\s*=>\s*\{?)\s*debugger/
+              $geo = /(Intl\.DateTimeFormat\(\)\.resolvedOptions\(\)\.timeZone|process\.env\.LANG)[^\n]{0,80}(===|!==|includes)\s*\(?['"`](ru|uk|by|kz|Europe\/Moscow)/ nocase
+            condition:
+              any of them
+          }
+
+          rule Guard_Config_Injector_Family
+          {
+            meta:
+              description = "config-file injector seen in real incidents: global.i/global.r markers, unicode-escaped core modules"
+            strings:
+              $g1 = /global\.i\s*=\s*['"][A-Za-z0-9-]{2,16}['"]/
+              $g2 = /global\.r\s*=\s*require\b/
+              $g3 = /global\.m\s*=\s*module\b/
+              $u = /require\s*\(\s*["'](\\u00[0-9a-fA-F]{2}){3,}["']\s*\)/
+            condition:
+              any of them
+          }
+
+          rule Guard_Git_History_Tampering
+          {
+            meta:
+              description = "script that silently amends and force-pushes commits, disables hooks/credential prompts or fakes commit time"
+            strings:
+              $amend = /commit\s+[^\n]{0,40}--amend/
+              $noverify = "--no-verify"
+              $force = /push\s+[^\n]{0,60}(\s-[a-zA-Z]*f[a-zA-Z]*\b|--force)/
+              $cred = /credential\.helper\s*=?\s*["']{2}/
+              $date = /(^|\n)\s*(date|time)\s+%[A-Za-z_]+%/
+              $fake = /GIT_(AUTHOR|COMMITTER)_DATE\s*=/
+            condition:
+              ($amend and ($force or $noverify or $date or $fake)) or $cred
+          }
+          YARA
+      - name: Write policy checker
+        run: |
+          cat > "$RUNNER_TEMP/repo_policy.py" <<'PY'
+          import base64
+          import binascii
+          import json
+          import os
+          import re
+          import struct
+          import subprocess
+          import sys
+
+          # Owner-controlled exceptions: "path", "path:check" or "*:check:detail". Edited only in security-workflows.
+          ALLOW = set()
+
+          FONT_EXT = {".woff", ".woff2", ".ttf", ".otf", ".eot", ".ttc"}
+          IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".avif"}
+          TEXT_ONLY_EXT = {".json", ".jsonc", ".map", ".txt", ".md", ".csv", ".xml", ".yml", ".yaml", ".css", ".scss",
+                           ".html", ".svg", ".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx", ".env", ".lock"}
+          CODE_EXT = {".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx", ".json", ".jsonc", ".vue", ".svelte",
+                      ".astro", ".html", ".css", ".scss", ".sass", ".less", ".sh", ".yml", ".yaml", ".py", ".ps1", ".mdx"}
+          JS_EXT = {".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx", ".vue", ".svelte", ".astro"}
+          FORBIDDEN_EXT = {".exe", ".dll", ".so", ".dylib", ".node", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".wsf",
+                           ".jar", ".class", ".desktop", ".command", ".lnk", ".scr", ".hta", ".msi", ".msix", ".app",
+                           ".pkg", ".dmg", ".deb", ".rpm", ".apk", ".vsix", ".bin", ".dat", ".com", ".cpl", ".reg",
+                           ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".xz", ".bz2", ".iso", ".img", ".docm", ".xlsm"}
+          FORBIDDEN_PATHS = re.compile(
+              r"(^|/)(node_modules|\.idea|\.yarn/(releases|plugins|sdks)|\.codesandbox)(/|$)|(^|/)\.cursor/(?!rules/)"
+              r"|(^|/)(\.pnp\.c?js|\.pnp\.loader\.mjs|\.gitpod\.ya?ml|\.mcp\.json|\.envrc)$")
+          ENV_FILE = re.compile(r"(^|/)\.env(\.[^/]*)?$")
+          ENV_TEMPLATE = re.compile(r"\.(example|sample|template|dist)$")
+          DOUBLE_EXT = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|ttf|otf|woff2?|eot|pdf|txt|json|css|md|docx?|xlsx?)"
+                                  r"\.(js|cjs|mjs|ts|exe|sh|bat|cmd|ps1|scr|com|vbs|hta|lnk|py|jar)$", re.I)
+          CONFIG_NAME = re.compile(
+              r"^(.+\.config\.[cm]?[jt]s|\.(eslint|prettier|babel|swc|postcss|lintstaged|mocha)rc(\..+)?"
+              r"|[jt]sconfig(\..+)?\.json|nodemon\.json|gulpfile\.[cm]?[jt]s|gruntfile\.[cm]?[jt]s|\.mocharc\..+"
+              r"|esbuild\.[cm]?[jt]s|setupTests\.[cm]?[jt]s|(jest|vitest)\.setup\.[cm]?[jt]s)$", re.I)
+          CONFIG_CODE = re.compile(
+              r"child_process|\beval\s*\(|new\s+Function\b|Function\.constructor|\bvm\.[a-zA-Z]|\batob\s*\("
+              r"|Buffer\.from\s*\([^)]*(base64|hex)|String\.fromCharCode|(\\x[0-9a-fA-F]{2}){8}|\bfetch\s*\("
+              r"|\bhttps?\.(get|request)\s*\(|\baxios\b|\bnet\.(connect|createConnection|Socket)\b|\bdns\.(resolve|lookup)"
+              r"|require\s*\(\s*['\"](node:)?(https?|net|dgram|tls|child_process|vm|dns|os)['\"]"
+              r"|from\s+['\"](node:)?(https?|net|dgram|tls|child_process|vm|dns|os)['\"]"
+              r"|require\s*\(\s*[^'\"`)\s]|import\s*\(\s*[^'\"`)\s]|process\.(mainModule|binding)"
+              r"|\b(exec|execSync|spawn|spawnSync|execFile|fork)\s*\(|\bwriteFile(Sync)?\s*\(|\bunlink(Sync)?\s*\(|\brmSync\s*\("
+              r"|\bglobal\.\w+\s*=|globalThis\.\w+\s*=|(\\u00[0-9a-fA-F]{2}){3}")
+          CODE_MARKERS = [b"child_process", b"require(", b"eval(", b"module.exports", b"process.env", b"new Function",
+                          b"<script", b"#!/bin/", b"#!/usr/bin/env", b"powershell", b"import(", b"fromCharCode"]
+          EXEC_MAGIC = [(b"\x7fELF", "ELF executable"), (b"MZ", "Windows PE executable"), (b"\xfe\xed\xfa\xce", "Mach-O"),
+                        (b"\xfe\xed\xfa\xcf", "Mach-O"), (b"\xce\xfa\xed\xfe", "Mach-O"), (b"\xcf\xfa\xed\xfe", "Mach-O"),
+                        (b"\xca\xfe\xba\xbe", "Mach-O/Java class"), (b"PK\x03\x04", "ZIP/JAR archive"),
+                        (b"\x1f\x8b", "gzip archive"), (b"7z\xbc\xaf\x27\x1c", "7z archive"), (b"Rar!", "RAR archive"),
+                        (b"\x00asm", "WebAssembly"), (b"#!", "script with shebang")]
+          SHEBANG_OK_EXT = {".sh", ".bash", ".zsh", ".py", ".js", ".cjs", ".mjs", ".ts", ""}
+          OFFICE_EXT = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"}
+          IMAGE_SIG = [(b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), (b"GIF87a", ".gif"), (b"GIF89a", ".gif"),
+                       (b"BM", ".bmp"), (b"\x00\x00\x01\x00", ".ico")]
+          VSCODE_ALLOWED = re.compile(r"^(extensions|settings|launch|tasks)\.json$|\.code-snippets$")
+          VSCODE_RISKY_KEY = re.compile(
+              r"^(terminal\.integrated\.(profiles|automationProfile|env|shell|shellArgs|cwd)|task\.|security\.workspace\.|extensions\."
+              r"|npm\.scriptRunner|npm\.packageManager"
+              r"|git\.(path|hooks)|remote\.|http\.proxy)"
+              r"|\.((?i:path|executable|runtime|runtimeExecutable|runtimeArgs|tsdk|command|commandLine|interpreter|shell|shellArgs"
+              r"|env|args|nodeOptions|execArgv)|[a-zA-Z]*(Path|Command|CommandLine|Executable))$")
+          VSCODE_SAFE_RUNTIME = {"node", "npm", "npx", "yarn", "pnpm", "bun", "deno", "nodemon", "ts-node", "tsx"}
+          DEVCONTAINER_CMDS = ["onCreateCommand", "updateContentCommand", "postCreateCommand", "postStartCommand", "postAttachCommand"]
+          LIFECYCLE = {"preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
+                       "prepublishOnly", "prepack", "postpack", "dependencies"}
+          LIFECYCLE_SAFE = re.compile(r"^(husky( install)?|husky \|\| true|npx husky( install)?|patch-package|ngcc)$")
+          SCRIPT_DANGER = re.compile(
+              r"\b(curl|wget|iwr|Invoke-WebRequest|Invoke-Expression|iex|certutil|bitsadmin|nc|ncat|socat)\b|\|\s*(ba|z)?sh\b"
+              r"|node\s+(-e|--eval|-p|--print)\b|base64|\beval\b|rm\s+-[a-z]*r[a-z]*f?\s+[/~$*]|--no-preserve-root"
+              r"|chmod\s+(-R\s+)?[0-7]*7[0-7]*\s+/|>\s*/dev/|\bsudo\b|npm\s+(i|install)\s+-g|code\s+--install-extension"
+              r"|NODE_OPTIONS|LD_PRELOAD", re.I)
+          DEP_BAD_SPEC = re.compile(r"^(git\+|git:|github:|gitlab:|bitbucket:|https?:|file:|link:|portal:|workspace:)|\.tgz$|\.tar\.gz$|^[\w.-]+/[\w.-]+(#.*)?$")
+          DEP_ALIAS = re.compile(r"^npm:")
+          DEP_LOOSE = re.compile(r"^(\*|latest|next|x|)$|^>=?\s*0")
+          NPMRC_RISKY = re.compile(r"^\s*(script-shell|node-options|shell|git|onload-script|init-module|globalconfig|userconfig"
+                                   r"|prefix|cache|tmp|ca|cafile|strict-ssl\s*=\s*false|ignore-scripts\s*=\s*false|.*:_authToken"
+                                   r"|_auth|_password|.*registry\s*=)", re.I)
+          NPMRC_REGISTRY_OK = re.compile(r"registry\s*=\s*https://registry\.npmjs\.org/?\s*$", re.I)
+          C2_HOSTS = re.compile(
+              r"(?<![\w.-])(pastebin\.com|paste\.ee|hastebin|ghostbin|rentry\.co|ngrok(-free)?\.(io|app|dev)|serveo\.net|trycloudflare\.com"
+              r"|loca\.lt|localtunnel\.me|[a-z2-7]{16,56}\.onion\b|ipfs\.io/ipfs|cloudflare-ipfs|dweb\.link|transfer\.sh"
+              r"|webhook\.site|requestbin|pipedream\.net|interact\.sh|oast\.(pro|live|site|online|fun|me)|burpcollaborator"
+              r"|discord(app)?\.com/api/webhooks|api\.telegram\.org/bot|bit\.ly/|tinyurl\.com/|is\.gd/|t\.ly/|cutt\.ly/"
+              r"|duckdns\.org|no-ip\.(com|org)|ddns\.net|hopto\.org|zapto\.org|gist\.githubusercontent\.com"
+              r"|api\.trongrid\.io|bsc-dataseed|api\.aptoslabs\.com|fullnode\.mainnet)", re.I)
+          PUBLIC_IP_URL = re.compile(
+              r"\b(?:https?|wss?)://(?!(?:127\.|10\.|0\.0\.0\.0|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.))"
+              r"\d{1,3}(?:\.\d{1,3}){3}")
+          HOST_DATA = re.compile(r"os\.(userInfo|homedir|hostname|networkInterfaces|platform)\s*\(|process\.env\b(?!\.)|"
+                                 r"JSON\.stringify\(\s*process\.env|Object\.(keys|entries)\(\s*process\.env")
+          AGENT_FILE = re.compile(r"(^|/)(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|copilot-instructions\.md)$|(^|/)\.cursor/rules/")
+          TROJAN_UNICODE = re.compile("[​-‏‪-‮⁠-⁤⁦-⁩﻿]")
+          BASE64_BLOB = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
+          WORKFLOW_UNTRUSTED = re.compile(
+              r"\$\{\{\s*github\.(event\.(pull_request\.(title|body|head\.ref|head\.label)|issue\.(title|body)|comment\.body"
+              r"|review\.body|review_comment\.body|pages\.[^}]*page_name|commits\.[^}]*\.message|head_commit\.message"
+              r"|head_commit\.author\.(name|email))|head_ref)\s*\}\}")
+
+          findings = {"error": 0}
+          LOCAL_PACKAGES = set()
+
+
+          def report(level, path, check, msg):
+              keys = {path, f"{path}:{check}", f"*:{check}:{msg.split(':', 1)[0]}"}
+              if level == "error" and keys & ALLOW:
+                  level, msg = "warning", f"allowlisted: {msg}"
+              if level == "error":
+                  findings["error"] += 1
+              print(f"::{level} file={path}::[{check}] {msg}")
+
+
+          def fail(path, check, msg):
+              report("error", path, check, msg)
+
+
+          def warn(path, check, msg):
+              report("warning", path, check, msg)
+
+
+          def strip_jsonc(text):
+              out, i, n = [], 0, len(text)
+              while i < n:
+                  c = text[i]
+                  if c == '"':
+                      j = i + 1
+                      while j < n and text[j] != '"':
+                          j += 2 if text[j] == "\\" else 1
+                      out.append(text[i:j + 1])
+                      i = j + 1
+                  elif text.startswith("//", i):
+                      while i < n and text[i] != "\n":
+                          i += 1
+                  elif text.startswith("/*", i):
+                      end = text.find("*/", i + 2)
+                      i = n if end < 0 else end + 2
+                  else:
+                      out.append(c)
+                      i += 1
+              return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+          def parse_jsonc(path, text):
+              try:
+                  return json.loads(strip_jsonc(text))
+              except ValueError as e:
+                  fail(path, "jsonc", f"not valid JSON/JSONC ({e}); this file must contain data only")
+                  return None
+
+
+          def sniff_exec(data):
+              for magic, label in EXEC_MAGIC:
+                  if data.startswith(magic):
+                      return label
+              if b"UPX!" in data[:4096]:
+                  return "UPX-packed executable"
+              return None
+
+
+          def check_font(path, data, label=None):
+              where = label or path
+              ext = os.path.splitext(path)[1].lower()
+              size = len(data)
+              if ext in (".woff", ".woff2"):
+                  magic = b"wOFF" if ext == ".woff" else b"wOF2"
+                  if data[:4] != magic:
+                      return fail(where, "font", f"not a real {ext} font (starts with {data[:8]!r}{', ' + sniff_exec(data) if sniff_exec(data) else ''})")
+                  declared = struct.unpack(">I", data[8:12])[0]
+                  if declared != size:
+                      return fail(where, "font", f"header length {declared} != file size {size}; data appended or truncated")
+              elif ext in (".ttf", ".otf"):
+                  if data[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1"):
+                      return fail(where, "font", f"not a real {ext} font (starts with {data[:8]!r}{', ' + sniff_exec(data) if sniff_exec(data) else ''})")
+                  num_tables = struct.unpack(">H", data[4:6])[0]
+                  end = 12 + 16 * num_tables
+                  if size < end:
+                      return fail(where, "font", "truncated table directory")
+                  for t in range(num_tables):
+                      off, length = struct.unpack(">II", data[12 + 16 * t + 8:12 + 16 * t + 16])
+                      end = max(end, off + length)
+                  if end > size:
+                      return fail(where, "font", "font tables extend past the end of the file (corrupt or crafted)")
+                  if size > ((end + 3) & ~3):
+                      return fail(where, "font", f"{size - end} bytes after the last font table; data appended")
+              elif ext == ".ttc":
+                  if data[:4] != b"ttcf":
+                      return fail(where, "font", "not a real .ttc font")
+              elif ext == ".eot":
+                  if size < 36 or data[34:36] != b"LP" or struct.unpack("<I", data[:4])[0] != size:
+                      return fail(where, "font", "not a real .eot font or size mismatch")
+              check_code_markers(where, data, "font")
+
+
+          def real_image_ext(data):
+              for sig, ext in IMAGE_SIG:
+                  if data.startswith(sig):
+                      return ext
+              if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                  return ".webp"
+              if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis", b"heic", b"heix", b"mif1"):
+                  return ".avif"
+              return None
+
+
+          def check_image(path, data):
+              ext = os.path.splitext(path)[1].lower()
+              real = real_image_ext(data)
+              if real and real != {".jpeg": ".jpg"}.get(ext, ext):
+                  warn(path, "image", f"image is really {real}; rename it")
+                  ext = real
+              ok = {
+                  ".png": data[:8] == b"\x89PNG\r\n\x1a\n",
+                  ".jpg": data[:3] == b"\xff\xd8\xff", ".jpeg": data[:3] == b"\xff\xd8\xff",
+                  ".gif": data[:6] in (b"GIF87a", b"GIF89a"),
+                  ".webp": data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+                  ".ico": data[:4] in (b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"),
+                  ".bmp": data[:2] == b"BM",
+                  ".avif": data[4:12] in (b"ftypavif", b"ftypavis"),
+              }[ext]
+              if not ok:
+                  kind = sniff_exec(data)
+                  return fail(path, "image", f"not a real {ext} image (starts with {data[:8]!r}{', ' + kind if kind else ''})")
+              if ext == ".png" and not data.endswith(b"IEND\xaeB`\x82"):
+                  return fail(path, "image", "data after the PNG IEND chunk (polyglot/appended payload)")
+              if ext in (".jpg", ".jpeg") and b"\xff\xd9" not in data[-32:]:
+                  return fail(path, "image", "data after the JPEG end marker (polyglot/appended payload)")
+              if ext == ".gif" and not data.rstrip(b"\x00").endswith(b";"):
+                  return fail(path, "image", "data after the GIF trailer")
+              if ext == ".webp" and struct.unpack("<I", data[4:8])[0] + 8 != len(data):
+                  return fail(path, "image", "RIFF size mismatch; data appended")
+              check_code_markers(path, data, "image")
+
+
+          def check_code_markers(path, data, check):
+              found = [m.decode() for m in CODE_MARKERS if m in data]
+              if found:
+                  fail(path, check, f"binary asset contains code markers {found}")
+
+
+          def check_media(path, data):
+              ext = os.path.splitext(path)[1].lower()
+              if ext == ".pdf":
+                  if not data.startswith(b"%PDF-"):
+                      return fail(path, "pdf", "not a real PDF")
+                  active = [k.decode() for k in (b"/JavaScript", b"/JS", b"/OpenAction", b"/Launch", b"/EmbeddedFile", b"/AA", b"/RichMedia")
+                            if re.search(re.escape(k) + rb"[\s/<(\[]", data)]
+                  if active:
+                      fail(path, "pdf", f"PDF contains active content {active}")
+              elif ext in (".mp4", ".m4a", ".mov") and data[4:8] != b"ftyp":
+                  fail(path, "media", f"not a real {ext} file")
+              elif ext == ".mp3" and not (data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+                  fail(path, "media", "not a real .mp3 file")
+              elif ext == ".webm" and data[:4] != b"\x1a\x45\xdf\xa3":
+                  fail(path, "media", "not a real .webm file")
+              elif ext == ".wasm":
+                  if not data.startswith(b"\x00asm"):
+                      fail(path, "wasm", "not a real WebAssembly module")
+                  else:
+                      warn(path, "wasm", "committed WebAssembly binary; reviewer must confirm its source")
+
+
+          def check_svg(path, text):
+              m = re.search(r"<script|\bon[a-z]+\s*=|javascript:|<foreignObject|<iframe|<embed|<object|xlink:href\s*=\s*['\"]data:|href\s*=\s*['\"]data:", text, re.I)
+              if m:
+                  fail(path, "svg", f"SVG contains active content ({m.group(0)!r})")
+
+
+          def check_html(path, text):
+              for m in re.finditer(r"<script[^>]*\bsrc\s*=\s*['\"](https?:)?//([^/'\"]+)", text, re.I):
+                  warn(path, "html", f"external script from {m.group(2)}")
+
+
+          def check_text(path, text, lines, ext):
+              if ext in CODE_EXT or AGENT_FILE.search(path):
+                  check_hidden(path, lines)
+              m = TROJAN_UNICODE.search(text, 1)
+              if m:
+                  no = text.count("\n", 0, m.start()) + 1
+                  fail(path, "trojan-source", f"line {no}: invisible/bidirectional Unicode U+{ord(m.group(0)):04X}")
+              if ext in JS_EXT and not re.search(r"\.min\.[cm]?js$", path):
+                  for no, line in enumerate(lines, 1):
+                      if len(line) > 3000:
+                          (fail if CONFIG_CODE.search(line) or "_0x" in line else warn)(
+                              path, "giant-line", f"line {no} is {len(line)} chars; minified/obfuscated code is not allowed in source")
+                          break
+              if re.search(r"\.min\.[cm]?js$|\.map$", path) and re.match(r"(src|server|client|app|api|lib|routes|controllers|models|middleware)/", path):
+                  warn(path, "bundle", "minified bundle or source map committed inside a source directory")
+              check_base64(path, text)
+              if ext in JS_EXT or ext in (".json", ".html", ".sh", ".py", ".yml", ".yaml"):
+                  check_network(path, text)
+
+
+          def check_hidden(path, lines):
+              for no, line in enumerate(lines, 1):
+                  gap = re.search(r"\S[ \t]{60,}\S", line)
+                  lead = len(line) - len(line.lstrip(" \t"))
+                  if gap or (lead >= 200 and line.strip()):
+                      n = gap.end() - gap.start() - 2 if gap else lead
+                      fail(path, "hidden-code", f"line {no}: content pushed off-screen after {n} whitespace chars")
+                      break
+              blank = 0
+              for no, line in enumerate(lines, 1):
+                  if line.strip():
+                      if blank >= 30:
+                          fail(path, "hidden-code", f"line {no}: content after {blank} blank lines")
+                          break
+                      blank = 0
+                  else:
+                      blank += 1
+
+
+          def check_base64(path, text):
+              for m in BASE64_BLOB.finditer(text):
+                  blob = m.group(0)
+                  try:
+                      raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
+                  except (binascii.Error, ValueError):
+                      continue
+                  no = text.count("\n", 0, m.start()) + 1
+                  kind = sniff_exec(raw)
+                  if kind and kind != "script with shebang":
+                      fail(path, "base64-payload", f"line {no}: base64 blob decodes to {kind}")
+                  elif raw.startswith(b"#!") or any(k in raw for k in (b"child_process", b"require(", b"eval(", b"new Function", b"powershell", b"/bin/sh", b"/bin/bash")):
+                      fail(path, "base64-payload", f"line {no}: base64 blob decodes to executable script/code")
+                  elif raw[:4] in (b"wOFF", b"wOF2", b"OTTO", b"\x00\x01\x00\x00"):
+                      ext = {b"wOFF": ".woff", b"wOF2": ".woff2", b"OTTO": ".otf", b"\x00\x01\x00\x00": ".ttf"}[raw[:4]]
+                      check_font("embedded" + ext, raw, label=f"{path} (line {no}, embedded font)")
+
+
+          def check_network(path, text):
+              m = C2_HOSTS.search(text)
+              if m:
+                  no = text.count("\n", 0, m.start()) + 1
+                  fail(path, "c2-endpoint", f"line {no}: reference to {m.group(0)!r} (paste/tunnel/webhook/shortener/dynamic-DNS/blockchain-RPC host)")
+              m = PUBLIC_IP_URL.search(text)
+              if m:
+                  no = text.count("\n", 0, m.start()) + 1
+                  if HOST_DATA.search(text):
+                      fail(path, "exfil", f"line {no}: hardcoded IP endpoint {m.group(0)!r} in a file that reads host data/env")
+                  else:
+                      warn(path, "exfil", f"line {no}: hardcoded IP endpoint {m.group(0)!r}; use a hostname from config")
+
+
+          def check_config(path, text, lines):
+              for no, line in enumerate(lines, 1):
+                  if len(line) > 400:
+                      fail(path, "config", f"line {no} is {len(line)} chars; config files must not contain long/minified lines")
+                      break
+              base = os.path.basename(path)
+              if base.endswith((".json", ".jsonc")) or base in (".babelrc", ".swcrc"):
+                  parse_jsonc(path, text)
+                  return
+              m = CONFIG_CODE.search(text)
+              if m:
+                  no = text.count("\n", 0, m.start()) + 1
+                  fail(path, "config", f"line {no}: build/tool config runs code ({m.group(0).strip()!r}); configs may only import plugins and export settings")
+
+
+          def check_vscode(path, text):
+              name = path.split(".vscode/", 1)[1]
+              if "/" in name or not VSCODE_ALLOWED.search(name):
+                  return fail(path, "vscode", "only extensions.json, settings.json, launch.json, tasks.json and *.code-snippets may live in .vscode/")
+              if re.search(r"\\u[0-9a-fA-F]{4}", text):
+                  return fail(path, "vscode", "\\u escapes are not allowed in .vscode files (used to hide keys)")
+              data = parse_jsonc(path, text)
+              if not isinstance(data, dict):
+                  return
+              if name == "tasks.json":
+                  check_tasks(path, data.get("tasks", []))
+              elif name == "settings.json":
+                  risky = [k for k in data if VSCODE_RISKY_KEY.search(k)
+                           and not (k.endswith("tsdk") and re.fullmatch(r"(\./)?node_modules/typescript/lib/?", str(data[k])))]
+                  if risky:
+                      fail(path, "vscode", f"settings that run programs, change shells/env or weaken trust are not allowed: {risky}")
+              elif name == "launch.json":
+                  for cfg in data.get("configurations", []) or []:
+                      rt = str(cfg.get("runtimeExecutable", ""))
+                      if rt and (rt not in VSCODE_SAFE_RUNTIME or "/" in rt or "\\" in rt):
+                          fail(path, "vscode", f"launch runtimeExecutable {rt!r} is not a standard runtime")
+                      prog = str(cfg.get("program", ""))
+                      if prog and not prog.startswith("${workspaceFolder}"):
+                          fail(path, "vscode", f"launch program {prog!r} is outside the workspace")
+                      for key in ("env", "runtimeArgs"):
+                          if re.search(r"NODE_OPTIONS|LD_PRELOAD|--require|--import|-r\b", json.dumps(cfg.get(key, ""))):
+                              fail(path, "vscode", f"launch {key} injects code (NODE_OPTIONS/LD_PRELOAD/--require)")
+                      if cfg.get("preLaunchTask"):
+                          warn(path, "vscode", f"preLaunchTask {cfg['preLaunchTask']!r} runs before debugging; reviewer must read tasks.json")
+              elif name == "extensions.json":
+                  recs = data.get("recommendations", []) or []
+                  if recs:
+                      warn(path, "vscode", f"recommended extensions (reviewer must confirm exact publisher IDs): {recs}")
+
+
+          def check_tasks(path, tasks):
+              for task in tasks or []:
+                  label = task.get("label", "?")
+                  blob = json.dumps(task)
+                  if re.search(r'"runOn"\s*:\s*"folderOpen"', blob):
+                      fail(path, "vscode", f"task {label!r} auto-runs on folder open (runOptions.runOn: folderOpen)")
+                  if re.search(r'"reveal"\s*:\s*"never"', blob) or task.get("isBackground"):
+                      warn(path, "vscode", f"task {label!r} is hidden/background")
+                  if SCRIPT_DANGER.search(blob):
+                      fail(path, "vscode", f"task {label!r} runs network/encoded/destructive commands")
+
+
+          def check_workspace_file(path, text):
+              data = parse_jsonc(path, text)
+              if not isinstance(data, dict):
+                  return
+              check_tasks(path, (data.get("tasks") or {}).get("tasks", []))
+              risky = [k for k in (data.get("settings") or {}) if VSCODE_RISKY_KEY.search(k)]
+              if risky:
+                  fail(path, "vscode", f"risky workspace settings: {risky}")
+
+
+          def check_devcontainer(path, text):
+              data = parse_jsonc(path, text)
+              if not isinstance(data, dict):
+                  return
+              if "initializeCommand" in data:
+                  fail(path, "devcontainer", "initializeCommand runs on the developer's HOST machine")
+              blob = json.dumps(data)
+              if data.get("privileged") or re.search(r"--privileged|docker\.sock|source=(/|\$\{localEnv:HOME\}|~)[,\"]|--pid=host|--network=host|SYS_ADMIN", blob):
+                  fail(path, "devcontainer", "privileged container, host root/home mount, docker.sock or host namespaces")
+              for key in DEVCONTAINER_CMDS:
+                  if key in data:
+                      (fail if SCRIPT_DANGER.search(json.dumps(data[key])) else warn)(path, "devcontainer", f"{key} runs automatically: {data[key]!r}")
+
+
+          def check_claude(path, text):
+              if path.endswith(".json"):
+                  data = parse_jsonc(path, text)
+                  if isinstance(data, dict) and ("hooks" in data or "statusLine" in data or "apiKeyHelper" in data):
+                      fail(path, "agent-config", "committed Claude Code settings define hooks/statusLine/apiKeyHelper (auto-executing commands)")
+                  if isinstance(data, dict) and (data.get("permissions") or {}).get("allow"):
+                      warn(path, "agent-config", f"pre-approved agent permissions: {data['permissions']['allow']}")
+              else:
+                  warn(path, "agent-config", "agent command/skill definition; reviewer must read it")
+
+
+          def check_agent_instructions(path, text):
+              m = re.search(r"(curl|wget|iwr)[^\n]{0,200}\|\s*(ba|z)?sh|run (this|the following) (silently|without (asking|telling))"
+                            r"|do not (tell|inform|mention)[^\n]{0,40}user|ignore (all |any )?(previous|prior) instructions"
+                            r"|dangerously-skip-permissions|--yolo\b", text, re.I)
+              if m:
+                  fail(path, "agent-config", f"agent instructions contain command/concealment directive {m.group(0)!r}")
+
+
+          def check_git_files(path, text, base):
+              if base == ".gitattributes":
+                  for no, line in enumerate(text.splitlines(), 1):
+                      m = re.search(r"\b(filter|diff|merge)=(?!lfs\b)(\S+)", line)
+                      if m:
+                          fail(path, "git", f"line {no}: custom {m.group(1)} driver {m.group(2)!r} (executes local commands when configured)")
+              elif base == ".gitmodules":
+                  # Set by GitHub Actions; the skill's preflight derives it from the origin remote.
+                  org = os.environ.get("GITHUB_REPOSITORY_OWNER", "")
+                  for url in re.findall(r"url\s*=\s*(\S+)", text):
+                      if not org or not re.match(r"(https://github\.com/|git@github\.com:)" + re.escape(org) + "/", url, re.I):
+                          fail(path, "git", f"submodule points outside the {org or 'unknown'} organization: {url}")
+              else:
+                  warn(path, "git-hooks", "git hook configuration; runs on developers' machines, reviewer must read it")
+
+
+          def check_npmrc(path, text):
+              for no, line in enumerate(text.splitlines(), 1):
+                  if line.strip().startswith(("#", ";")) or not line.strip():
+                      continue
+                  if NPMRC_RISKY.match(line) and not NPMRC_REGISTRY_OK.search(line):
+                      fail(path, "npmrc", f"line {no}: risky npm setting {line.strip().split('=')[0]!r} (shell/node-options/registry/auth/ssl)")
+
+
+          def check_yarnrc(path, text):
+              for no, line in enumerate(text.splitlines(), 1):
+                  m = re.match(r"\s*[\"']?(yarnPath|yarn-path|npmRegistryServer|registry|npmAuthToken|npmAuthIdent|_authToken"
+                               r"|unsafeHttpWhitelist|enableStrictSsl|httpsProxy|httpProxy|injectEnvironmentFiles|plugins)\b", line)
+                  if m and not re.search(r"https://registry\.(npmjs\.org|yarnpkg\.com)", line):
+                      fail(path, "yarnrc", f"line {no}: risky yarn setting {m.group(1)!r} (binary path/registry/auth/ssl/plugins)")
+
+
+          def check_env(path, text):
+              if not ENV_TEMPLATE.search(path):
+                  return fail(path, "env-file", "real .env files must not be committed; commit .env.example with placeholders")
+              if re.search(r"^\s*(NODE_OPTIONS|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|ENV|PROMPT_COMMAND)\s*=", text, re.M):
+                  fail(path, "env-file", "env template sets a code-loading variable (NODE_OPTIONS/LD_PRELOAD/…)")
+
+
+          def check_package_json(path, text):
+              data = parse_jsonc(path, text)
+              if not isinstance(data, dict):
+                  return
+              scripts = data.get("scripts") or {}
+              for name, cmd in scripts.items():
+                  cmd = str(cmd)
+                  if name in LIFECYCLE and not LIFECYCLE_SAFE.match(cmd.strip()):
+                      fail(path, "npm-scripts", f"lifecycle script {name!r} runs automatically on install: {cmd!r}")
+                  elif SCRIPT_DANGER.search(cmd):
+                      fail(path, "npm-scripts", f"script {name!r} downloads/evals/deletes or injects code: {cmd!r}")
+                  elif (name.startswith("pre") and name[3:] in scripts) or (name.startswith("post") and name[4:] in scripts):
+                      warn(path, "npm-scripts", f"hook {name!r} runs implicitly: {cmd!r}")
+              for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "bundleDependencies"):
+                  deps = data.get(section) or {}
+                  if isinstance(deps, list):
+                      fail(path, "npm-deps", f"{section} bundles packages into the tarball: {deps}")
+                      continue
+                  for dep, spec in deps.items():
+                      spec = str(spec).strip()
+                      if dep in LOCAL_PACKAGES and (spec == "*" or re.match(r"(file|link|workspace):", spec)):
+                          if spec.startswith("file:"):
+                              warn(path, "npm-deps", f"{section}.{dep} = {spec!r} is a vendored/local package; it is scanned as part of this repo")
+                          continue
+                      if DEP_BAD_SPEC.search(spec):
+                          fail(path, "npm-deps", f"{section}.{dep} = {spec!r} installs from git/url/file instead of the npm registry")
+                      elif DEP_ALIAS.match(spec):
+                          fail(path, "npm-deps", f"{section}.{dep} = {spec!r} is an npm alias (package name differs from import name)")
+                      elif DEP_LOOSE.match(spec):
+                          fail(path, "npm-deps", f"{section}.{dep} = {spec!r} is an unpinned/wildcard range")
+              for section in ("overrides", "resolutions", "pnpm"):
+                  for dep, spec in flatten(data.get(section) or {}):
+                      if DEP_BAD_SPEC.search(spec) or DEP_ALIAS.match(spec) or DEP_LOOSE.match(spec):
+                          fail(path, "npm-deps", f"{section} redirects {dep} to {spec!r}")
+              if data.get("bin"):
+                  warn(path, "npm-bin", f"package declares bin entries: {data['bin']}")
+              for hook in ("simple-git-hooks", "husky", "lint-staged", "pre-commit"):
+                  if hook in data:
+                      warn(path, "git-hooks", f"{hook} config in package.json runs on developers' machines")
+
+
+          def flatten(obj, prefix=""):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      yield from flatten(v, f"{prefix}{k}>")
+              else:
+                  yield prefix.rstrip(">"), str(obj)
+
+
+          def check_docker(path, text):
+              for no, line in enumerate(text.splitlines(), 1):
+                  m = re.search(r"privileged:\s*true|--privileged|/var/run/docker\.sock|network_mode:\s*[\"']?host|pid:\s*[\"']?host"
+                                r"|cap_add:|SYS_ADMIN|^\s*-\s*[\"']?(/|~|\$\{?HOME\}?)(:|/:)|--mount[^\n]*source=/[ ,]"
+                                r"|(curl|wget)[^\n]*\|\s*(ba|z)?sh|ADD\s+https?://", line)
+                  if m:
+                      fail(path, "docker", f"line {no}: {m.group(0).strip()!r} (privileged/host access/remote script)")
+
+
+          def check_workflow(path, text):
+              if re.search(r"^\s*pull_request_target\s*:|^on:\s*\[?[^\n]*pull_request_target", text, re.M):
+                  fail(path, "workflow", "pull_request_target runs untrusted PR code with secrets")
+              if re.search(r"^\s*workflow_run\s*:", text, re.M):
+                  warn(path, "workflow", "workflow_run trigger runs with secrets after other workflows; reviewer must check artifacts handling")
+              for no, line in enumerate(text.splitlines(), 1):
+                  m = re.search(r"uses:\s*['\"]?([^@\s'\"]+)@([^\s'\"#]+)", line)
+                  if m and not m.group(1).startswith("./") and not re.fullmatch(r"[0-9a-f]{40}", m.group(2)):
+                      (warn if m.group(1).split("/")[0] in ("actions", "github") else fail)(
+                          path, "workflow", f"line {no}: {m.group(1)}@{m.group(2)} is not pinned to a full commit SHA")
+                  if re.search(r"(curl|wget)[^\n]*\|\s*(sudo\s+)?(ba|z)?sh", line):
+                      fail(path, "workflow", f"line {no}: pipes a remote script into a shell")
+                  if WORKFLOW_UNTRUSTED.search(line):
+                      fail(path, "workflow", f"line {no}: untrusted event text (PR title/body, branch name, comment) expanded inside a script (script injection); pass it via env")
+              if re.search(r"secrets\.[A-Z_]+[^\n]*(curl|wget|http)|toJSON\(\s*secrets\s*\)", text):
+                  fail(path, "workflow", "secrets passed to a network command or serialized wholesale")
+
+
+          def check_path(path, mode):
+              base = os.path.basename(path)
+              ext = os.path.splitext(base)[1].lower()
+              if re.search(r"[\x00-\x1f\x7f​-‏‪-‮⁦-⁩]", path):
+                  fail(path, "filename", "control, zero-width or right-to-left-override characters in the path")
+              if any(part != part.rstrip(" .") or part != part.lstrip(" ") for part in path.split("/")):
+                  fail(path, "filename", "path segment with leading/trailing space or trailing dot")
+              if DOUBLE_EXT.search(base):
+                  fail(path, "filename", "double extension disguising an executable/script")
+              if ext in FORBIDDEN_EXT:
+                  fail(path, "forbidden-file", f"{ext} files (executables, installers, archives, native addons, extensions) may not be committed")
+              if FORBIDDEN_PATHS.search(path):
+                  fail(path, "forbidden-file", "committed IDE/run-config, vendored node_modules, yarn binaries/PnP or non-npm lockfile")
+              if mode == "100755" and ext not in (".sh", ".py", ".js", ".mjs", ".cjs", "") and not path.startswith(".husky/"):
+                  warn(path, "exec-bit", "executable bit set on a non-script file")
+
+
+          def main():
+              listing = subprocess.run(["git", "ls-files", "-s", "-z"], capture_output=True, check=True).stdout.decode("utf-8", "surrogateescape")
+              root = os.path.realpath(".")
+              entries = list(filter(None, listing.split("\0")))
+              for entry in entries:
+                  rel = entry.split("\t", 1)[1]
+                  if os.path.basename(rel) == "package.json" and "node_modules/" not in rel and os.path.isfile(rel):
+                      try:
+                          with open(rel, encoding="utf-8") as f:
+                              LOCAL_PACKAGES.add(json.loads(strip_jsonc(f.read())).get("name"))
+                      except (ValueError, AttributeError):
+                          pass
+              for entry in entries:
+                  meta, path = entry.split("\t", 1)
+                  mode = meta.split()[0]
+                  check_path(path, mode)
+                  if mode == "120000":
+                      target = os.readlink(path)
+                      resolved = os.path.realpath(os.path.join(os.path.dirname(path), target))
+                      if os.path.isabs(target) or not (resolved == root or resolved.startswith(root + os.sep)):
+                          fail(path, "symlink", f"symlink points outside the repository: {target}")
+                      continue
+                  if mode == "160000" or not os.path.isfile(path):
+                      continue
+                  with open(path, "rb") as f:
+                      data = f.read()
+                  base = os.path.basename(path)
+                  ext = os.path.splitext(base)[1].lower()
+                  if len(data) > 5 * 1024 * 1024:
+                      warn(path, "large-file", f"{len(data) // 1024 // 1024} MB file; reviewer must confirm what it is")
+                  if ext in FONT_EXT:
+                      check_font(path, data)
+                      continue
+                  if ext in IMAGE_EXT:
+                      check_image(path, data)
+                      continue
+                  if ext in (".pdf", ".mp4", ".m4a", ".mov", ".mp3", ".webm", ".wasm"):
+                      check_media(path, data)
+                      continue
+                  if base == ".DS_Store":
+                      warn(path, "junk", "macOS .DS_Store committed; delete it and add it to .gitignore")
+                      continue
+                  kind = sniff_exec(data)
+                  if kind == "ZIP/JAR archive" and ext in OFFICE_EXT:
+                      warn(path, "office-doc", "Office document committed; keep documents outside code repos")
+                      continue
+                  if kind and not (kind == "script with shebang" and ext in SHEBANG_OK_EXT):
+                      fail(path, "disguised-file", f"content is a {kind} regardless of its {ext or 'missing'} extension")
+                      continue
+                  if b"\x00" in data[:8192]:
+                      if ext in TEXT_ONLY_EXT or ext == "" or ext in CODE_EXT:
+                          fail(path, "disguised-file", f"binary content in a {ext or 'extensionless'} file that should be text")
+                      else:
+                          warn(path, "binary", f"unrecognised binary file type {ext}")
+                      continue
+                  text = data.decode("utf-8", errors="replace")
+                  lines = text.splitlines()
+                  in_vscode = path.startswith(".vscode/") or "/.vscode/" in path
+                  if base != "package-lock.json":
+                      check_text(path, text, lines, ext)
+                  if ext == ".svg":
+                      check_svg(path, text)
+                  if ext in (".html", ".htm"):
+                      check_html(path, text)
+                  if CONFIG_NAME.match(base):
+                      check_config(path, text, lines)
+                  if in_vscode:
+                      check_vscode(path, text)
+                  if ext == ".code-workspace":
+                      check_workspace_file(path, text)
+                  if base in ("devcontainer.json", ".devcontainer.json"):
+                      check_devcontainer(path, text)
+                  if path.startswith(".claude/") or "/.claude/" in path:
+                      check_claude(path, text)
+                  if AGENT_FILE.search(path):
+                      check_agent_instructions(path, text)
+                  if base in (".gitattributes", ".gitmodules", ".pre-commit-config.yaml", "lefthook.yml", "lefthook.yaml", ".lefthook.yml") or path.startswith(".husky/"):
+                      check_git_files(path, text, base)
+                  if base == ".npmrc":
+                      check_npmrc(path, text)
+                  if base in (".yarnrc", ".yarnrc.yml"):
+                      check_yarnrc(path, text)
+                  if ENV_FILE.search(path):
+                      check_env(path, text)
+                  if base == "package.json" and "node_modules/" not in path:
+                      check_package_json(path, text)
+                  if re.match(r"(Dockerfile|Containerfile)(\..+)?$|.*\.dockerfile$|(docker-)?compose(\.[\w-]+)?\.ya?ml$", base, re.I):
+                      check_docker(path, text)
+                  if re.match(r"\.github/workflows/[^/]+\.ya?ml$", path):
+                      check_workflow(path, text)
+              if findings["error"]:
+                  print(f"repo-policy: {findings['error']} blocking finding(s)")
+                  sys.exit(1)
+              print("repo-policy: all checks passed")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Write dependency policy checker
+        run: |
+          cat > "$RUNNER_TEMP/deps_policy.py" <<'PY'
+          import concurrent.futures
+          import datetime
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          # Packages whose install/build scripts the owner has reviewed. Edited only in security-workflows.
+          INSTALL_SCRIPT_ALLOW = {
+              "esbuild", "sharp", "fsevents", "bcrypt", "@swc/core", "core-js", "core-js-pure", "es5-ext", "nodemon",
+              "protobufjs", "@parcel/watcher", "msgpackr-extract", "unrs-resolver", "puppeteer", "cypress", "electron",
+              "canvas", "sqlite3", "better-sqlite3", "bufferutil", "utf-8-validate", "@prisma/client", "prisma",
+              "@prisma/engines", "argon2", "cpu-features", "ssh2", "lmdb", "@sentry/cli", "@tailwindcss/oxide", "nx",
+              "@nestjs/core", "mongodb-memory-server", "@biomejs/biome", "@vercel/speed-insights", "styled-components",
+          }
+          ALLOW = set()  # "name" or "name@version" exceptions to the age/download gates
+          REGISTRY_URL = re.compile(r"^https://registry\.(npmjs\.org|yarnpkg\.com)/")
+          MIN_VERSION_AGE_HOURS = 72
+          MIN_PACKAGE_AGE_DAYS = 30
+          MIN_WEEKLY_DOWNLOADS = 1000
+          MAX_LOOKUPS = 400
+          LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+
+          errors = []
+
+
+          def fail(path, msg):
+              errors.append(msg)
+              print(f"::error file={path}::{msg}")
+
+
+          def warn(path, msg):
+              print(f"::warning file={path}::{msg}")
+
+
+          def git_files():
+              out = subprocess.run(["git", "ls-files", "-z"], capture_output=True, check=True).stdout.decode()
+              return [p for p in out.split("\0") if p and "node_modules/" not in p]
+
+
+          def git_show(ref, path):
+              r = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True)
+              return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+          def name_from_key(key):
+              return key.rsplit("node_modules/", 1)[-1]
+
+
+          def npm_lock_packages(text):
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  return {}, None
+              return data.get("packages") or {}, data
+
+
+          def check_npm_lock(path, text, manifest):
+              packages, data = npm_lock_packages(text)
+              if data is None:
+                  return fail(path, "lockfile is not valid JSON")
+              if not packages:
+                  return fail(path, "lockfileVersion 1 is not supported; regenerate with npm 7+")
+              for key, meta in packages.items():
+                  if not key or "node_modules/" not in key or meta.get("link"):
+                      continue
+                  name = name_from_key(key)
+                  resolved = meta.get("resolved", "")
+                  if resolved and not REGISTRY_URL.match(resolved):
+                      fail(path, f"{name} resolves outside the npm registry: {resolved}")
+                  if resolved and not meta.get("integrity"):
+                      fail(path, f"{name} has no integrity hash")
+                  if meta.get("hasInstallScript") and name not in INSTALL_SCRIPT_ALLOW:
+                      fail(path, f"{name}@{meta.get('version')} runs an install script and is not on the reviewed allowlist")
+              if manifest is not None:
+                  root = packages.get("", {})
+                  for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                      declared, locked = manifest.get(section) or {}, root.get(section) or {}
+                      if declared != locked:
+                          drift = sorted(set(declared.items()) ^ set(locked.items()))
+                          fail(path, f"package.json {section} and lockfile disagree (run npm install and commit the lockfile): {drift[:5]}")
+
+
+          def yarn_v1_entries(text):
+              entries, header, block = [], None, {}
+              for line in text.splitlines() + [""]:
+                  if line and not line.startswith(" ") and not line.startswith("#"):
+                      if header:
+                          entries.append((header, block))
+                      header, block = line.rstrip(":"), {}
+                  elif line.startswith("  ") and not line.startswith("    "):
+                      m = re.match(r'\s+(\w+)\s+"?([^"]*)"?', line)
+                      if m:
+                          block[m.group(1)] = m.group(2)
+              if header:
+                  entries.append((header, block))
+              return entries
+
+
+          def yarn_name(header):
+              spec = header.split(",")[0].strip().strip('"')
+              return spec[: spec.index("@", 1)] if "@" in spec[1:] else spec
+
+
+          def check_yarn_lock(path, text):
+              if "__metadata:" in text:
+                  for m in re.finditer(r'resolution:\s*"([^"]+)"', text):
+                      res = m.group(1)
+                      proto = re.search(r"@(npm|workspace|patch|git|git\+\w+|https?|file|link|portal|exec|github):", res)
+                      if proto and proto.group(1) not in ("npm", "workspace", "patch"):
+                          fail(path, f"{res} resolves outside the npm registry ({proto.group(1)}:)")
+                      if proto and proto.group(1) == "patch" and "builtin<compat/" not in res:
+                          fail(path, f"{res} applies a local patch to a dependency; reviewer must read the .patch file")
+                  return
+              for header, block in yarn_v1_entries(text):
+                  name = yarn_name(header)
+                  resolved = block.get("resolved", "")
+                  if resolved and not REGISTRY_URL.match(resolved):
+                      fail(path, f"{name} resolves outside the npm registry: {resolved}")
+                  if resolved and not block.get("integrity"):
+                      fail(path, f"{name} has no integrity hash")
+
+
+          def check_pnpm_lock(path, text):
+              for m in re.finditer(r"tarball:\s*(\S+)", text):
+                  if not REGISTRY_URL.match(m.group(1)):
+                      fail(path, f"tarball outside the npm registry: {m.group(1)}")
+              for m in re.finditer(r"(repo|commit):\s*(\S+)", text):
+                  fail(path, f"git dependency in lockfile: {m.group(2)}")
+              for m in re.finditer(r"\n  '?/?(@?[^@\s'(]+)@[^:\n]+'?:\n(?:    [^\n]*\n)*?    requiresBuild: true", text):
+                  if m.group(1) not in INSTALL_SCRIPT_ALLOW:
+                      fail(path, f"{m.group(1)} runs a build/install script and is not on the reviewed allowlist")
+
+
+          def locked_versions(kind, text):
+              found = set()
+              if kind in ("package-lock.json", "npm-shrinkwrap.json"):
+                  packages, _ = npm_lock_packages(text)
+                  for key, meta in packages.items():
+                      if "node_modules/" in key and not meta.get("link") and meta.get("version"):
+                          found.add((name_from_key(key), meta["version"]))
+              elif kind == "yarn.lock":
+                  if "__metadata:" in text:
+                      found |= set(re.findall(r'resolution:\s*"(@?[^@"]+)@npm:([^"]+)"', text))
+                  else:
+                      found |= {(yarn_name(h), b["version"]) for h, b in yarn_v1_entries(text) if b.get("version")}
+              else:
+                  found |= set(re.findall(r"\n  '?/?(@?[^@\s'(]+)@(\d[^:(\s']*)", text))
+              return found
+
+
+          def fetch_json(url):
+              req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "gh-org-guard"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+
+          def vet(pkg, direct, local_names):
+              name, version = pkg
+              if name in local_names or name in ALLOW or f"{name}@{version}" in ALLOW:
+                  return []
+              problems = []
+              now = datetime.datetime.now(datetime.timezone.utc)
+              try:
+                  doc = fetch_json("https://registry.npmjs.org/" + urllib.parse.quote(name, safe="@"))
+              except urllib.error.HTTPError as e:
+                  return [f"{name}: not found on the public npm registry ({e.code}); possible dependency-confusion/typo"]
+              except (urllib.error.URLError, TimeoutError, ValueError) as e:
+                  return [f"{name}: registry lookup failed ({e}); failing closed"]
+              times = doc.get("time") or {}
+              published, created = times.get(version), times.get("created")
+              if published:
+                  age = now - datetime.datetime.fromisoformat(published.replace("Z", "+00:00"))
+                  if age < datetime.timedelta(hours=MIN_VERSION_AGE_HOURS):
+                      problems.append(f"{name}@{version} was published {int(age.total_seconds() // 3600)}h ago; wait {MIN_VERSION_AGE_HOURS}h (cooldown against hijacked releases)")
+              if created:
+                  age = now - datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                  if age < datetime.timedelta(days=MIN_PACKAGE_AGE_DAYS):
+                      problems.append(f"{name} was created {age.days} day(s) ago; brand-new packages need owner review")
+              if (doc.get("versions") or {}).get(version, {}).get("deprecated"):
+                  warn("package.json", f"{name}@{version} is deprecated: {doc['versions'][version]['deprecated']}")
+              if direct:
+                  try:
+                      dl = fetch_json("https://api.npmjs.org/downloads/point/last-week/" + urllib.parse.quote(name, safe="@")).get("downloads", 0)
+                  except (urllib.error.URLError, TimeoutError, ValueError):
+                      dl = None
+                  if dl is not None and dl < MIN_WEEKLY_DOWNLOADS:
+                      problems.append(f"{name} has {dl} downloads/week; low-adoption direct dependencies need owner review (typosquat check)")
+              return problems
+
+
+          def main():
+              base = sys.argv[1] if len(sys.argv) > 1 else None
+              files = git_files()
+              local_names, manifests = set(), {}
+              for f in files:
+                  if os.path.basename(f) == "package.json":
+                      try:
+                          with open(f, encoding="utf-8") as fh:
+                              manifests[os.path.dirname(f)] = json.load(fh)
+                          local_names.add(manifests[os.path.dirname(f)].get("name"))
+                      except (OSError, ValueError):
+                          fail(f, "package.json is not valid JSON")
+              locks = {}
+              for f in files:
+                  if os.path.basename(f) in LOCKFILES:
+                      locks.setdefault(os.path.dirname(f), []).append(f)
+              for d, fs in locks.items():
+                  if len(fs) > 1:
+                      fail(fs[0], f"multiple lockfiles in {d or '.'}: {fs}; keep exactly one package manager")
+              for d in manifests:
+                  parts = d.split("/") if d else []
+                  if not any("/".join(parts[:i]) in locks for i in range(len(parts), -1, -1)):
+                      fail(os.path.join(d, "package.json"), "no lockfile in this directory or any parent; commit the lockfile")
+              new_pkgs, direct = set(), set()
+              for d, fs in locks.items():
+                  for f in fs:
+                      kind = os.path.basename(f)
+                      with open(f, encoding="utf-8", errors="replace") as fh:
+                          text = fh.read()
+                      if kind in ("package-lock.json", "npm-shrinkwrap.json"):
+                          check_npm_lock(f, text, manifests.get(d))
+                      elif kind == "yarn.lock":
+                          check_yarn_lock(f, text)
+                      else:
+                          check_pnpm_lock(f, text)
+                      if base:
+                          added = locked_versions(kind, text) - locked_versions(kind, git_show(base, f))
+                          new_pkgs |= added
+                          for m in manifests.values():
+                              for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                                  direct |= set((m.get(section) or {}).keys())
+              if new_pkgs:
+                  todo = sorted(new_pkgs)
+                  print(f"Vetting {len(todo)} new or changed package version(s) against the npm registry")
+                  if len(todo) > MAX_LOOKUPS:
+                      warn(".", f"{len(todo)} new package versions; vetting the first {MAX_LOOKUPS} (split large upgrades into smaller PRs)")
+                      todo = todo[:MAX_LOOKUPS]
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                      for problems in pool.map(lambda p: vet(p, p[0] in direct, local_names), todo):
+                          for msg in problems:
+                              fail("package.json", msg)
+              if errors:
+                  print(f"deps-policy: {len(errors)} blocking finding(s)")
+                  sys.exit(1)
+              print("deps-policy: all checks passed")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      # Every check runs even when an earlier one fails, so one run reports all findings.
+      - name: clamav
+        id: clamav
+        if: ${{ !cancelled() }}
+        run: clamscan --recursive --infected --exclude-dir='/\.git$' .
+      - name: yara
+        id: yara
+        if: ${{ !cancelled() }}
+        run: |
+          hits=$(yara --recursive --no-warnings "$RUNNER_TEMP/guard.yar" .)
+          if [ -n "$hits" ]; then
+            echo "::error::YARA rules matched suspicious code"
+            echo "$hits"
+            exit 1
+          fi
+      - name: gitleaks
+        id: gitleaks
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --log-opts="${BASE_SHA}..${HEAD_SHA}" \
+            --redact --no-banner --exit-code 1 --verbose .
+      - name: repo-policy
+        id: repo_policy
+        if: ${{ !cancelled() }}
+        run: python3 -I "$RUNNER_TEMP/repo_policy.py"
+      - name: ai-coauthor
+        id: ai_coauthor
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='(noreply@anthropic\.com|@anthropic\.com|claude code|claude (opus|sonnet|haiku|fable)|cursoragent|@cursor\.(com|sh)|copilot@users\.noreply\.github\.com|copilot-swe-agent|@openai\.com|chatgpt|openai codex|devin-ai-integration|aider@aider\.chat|codeium|windsurf|tabnine|gemini-code-assist|amazon q developer)'
+          bad=0
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            meta=$(git show -s --format='%an <%ae>%n%cn <%ce>%n%B' "$sha")
+            if hits=$(printf '%s\n' "$meta" | grep -inE "$pattern"); then
+              echo "::error::Commit $sha credits an AI tool:"
+              printf '%s\n' "$hits" | sed 's/^/    /'
+              bad=1
+            fi
+          done
+          exit "$bad"
+      # Last on purpose: package-manager audits may load repo-controlled config, so nothing else runs after them.
+      - name: dependency-audit
+        id: dependency_audit
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          fail=0
+          echo "::group::Lockfile integrity, install scripts, new-package vetting"
+          python3 -I "$RUNNER_TEMP/deps_policy.py" "$BASE_SHA" || fail=1
+          echo "::endgroup::"
+          for lock in $(git ls-files 'package-lock.json' '*/package-lock.json' 'yarn.lock' '*/yarn.lock' 'pnpm-lock.yaml' '*/pnpm-lock.yaml' | grep -v 'node_modules/'); do
+            dir=$(dirname "$lock")
+            case "$(basename "$lock")" in
+              package-lock.json)
+                all_critical="npm audit --audit-level=critical"
+                prod_high="npm audit --omit=dev --audit-level=high"
+                all_high="npm audit --audit-level=high" ;;
+              yarn.lock)
+                if grep -q '^__metadata:' "$lock"; then
+                  corepack enable
+                  all_critical="yarn npm audit --all --recursive --severity critical"
+                  prod_high="yarn npm audit --all --recursive --environment production --severity high"
+                  all_high="yarn npm audit --all --recursive --severity high"
+                else
+                  all_critical="npx --yes yarn@1.22.22 audit --level critical"
+                  prod_high="npx --yes yarn@1.22.22 audit --level high --groups dependencies"
+                  all_high="npx --yes yarn@1.22.22 audit --level high"
+                fi ;;
+              pnpm-lock.yaml)
+                all_critical="npx --yes pnpm@12.8.2 audit --audit-level critical"
+                prod_high="npx --yes pnpm@12.8.2 audit --prod --audit-level high"
+                all_high="npx --yes pnpm@12.8.2 audit --audit-level high" ;;
+            esac
+            echo "::group::$lock: critical advisories in any dependency (includes malware)"
+            (cd "$dir" && $all_critical) || { fail=1; echo "::error file=$lock::critical advisory (possibly malware) in a dependency"; }
+            echo "::endgroup::"
+            echo "::group::$lock: high advisories in production dependencies"
+            prod_ok=1
+            (cd "$dir" && $prod_high) || { fail=1; prod_ok=0; echo "::error file=$lock::high-severity advisory in a production dependency"; }
+            echo "::endgroup::"
+            if [ "$prod_ok" = 1 ] && ! (cd "$dir" && $all_high > /dev/null 2>&1); then
+              echo "::warning file=$lock::high-severity advisories in dev-only dependencies (not blocking); run the audit locally and upgrade"
+            fi
+          done
+          exit "$fail"
+
+      - name: Result
+        id: result
+        if: ${{ !cancelled() }}
+        env:
+          OUTCOMES: >-
+            clamav=${{ steps.clamav.outcome }}
+            yara=${{ steps.yara.outcome }}
+            gitleaks=${{ steps.gitleaks.outcome }}
+            repo-policy=${{ steps.repo_policy.outcome }}
+            ai-coauthor=${{ steps.ai_coauthor.outcome }}
+            dependency-audit=${{ steps.dependency_audit.outcome }}
+        run: |
+          failed=""
+          for pair in $OUTCOMES; do
+            [ "${pair#*=}" = success ] || failed="$failed,${pair%%=*}"
+          done
+          failed=${failed#,}
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::error::Failed checks: $failed"
+            exit 1
+          fi
+
+  report:
+    name: report
+    needs: scan
+    if: failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update a security issue tagging owner and author
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FAILED: ${{ needs.scan.outputs.failed }}
+          SECURITY_OWNER: ${{ vars.SECURITY_OWNER }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const label = 'security-scan';
+            const failed = (process.env.FAILED || '').split(',').filter(Boolean);
+            const owners = [...new Set((process.env.SECURITY_OWNER || '')
+              .split(/[\s,]+/)
+              .map((login) => login.replace(/^@/, '').toLowerCase())
+              .filter(Boolean))];
+            if (owners.length === 0) {
+              core.warning('Organization variable SECURITY_OWNER is not set; no security owner will be tagged.');
+            }
+            const tag = (login) => (login.endsWith('[bot]') ? login : `@${login}`);
+            const describe = (login) => `${tag(login)}${owners.includes(login.toLowerCase()) ? ' (also a security owner)' : ''}`;
+            const pushers = [...new Map([context.actor, pr.user.login].map((login) => [login.toLowerCase(), login])).values()];
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const title = `⚠️ Security scan failed on PR #${pr.number}`;
+            const body = [
+              `**Security owners:** ${owners.length ? owners.map(tag).join(' ') : '_not configured_'}`,
+              `**Pushed by:** ${describe(context.actor)}`,
+              ...(pushers.length > 1 ? [`**PR author:** ${describe(pr.user.login)}`] : []),
+              '',
+              `The required security scan blocked ${pr.html_url} at commit \`${pr.head.sha}\`.`,
+              '',
+              `**Failed checks:** ${failed.length ? failed.map((name) => `\`${name}\``).join(', ') : 'a setup step (see run logs)'}`,
+              `**Run logs:** ${runUrl}`,
+              '',
+              'The PR cannot merge until every check passes. If a finding is a false positive, the owner decides whether to adjust the rule; do not bypass the ruleset.',
+            ].join('\n');
+
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'b60205' });
+            } catch (error) {
+              if (error.status !== 422) throw error;
+            }
+
+            const open = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', labels: label });
+            const existing = open.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+            }

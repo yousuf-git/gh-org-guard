@@ -1,0 +1,20 @@
+*                         @your-org/security-leads
+
+/.github/                 @your-org/security-leads
+/.vscode/                 @your-org/security-leads
+/.devcontainer/           @your-org/security-leads
+/.claude/                 @your-org/security-leads
+/.cursor/                 @your-org/security-leads
+/.husky/                  @your-org/security-leads
+**/package.json           @your-org/security-leads
+**/package-lock.json      @your-org/security-leads
+**/yarn.lock              @your-org/security-leads
+**/pnpm-lock.yaml         @your-org/security-leads
+**/.npmrc                 @your-org/security-leads
+**/.yarnrc*               @your-org/security-leads
+**/*.config.*             @your-org/security-leads
+**/tsconfig*.json         @your-org/security-leads
+**/Dockerfile*            @your-org/security-leads
+**/docker-compose*        @your-org/security-leads
+**/AGENTS.md              @your-org/security-leads
+**/CLAUDE.md              @your-org/security-leads

@@ -1,0 +1,1 @@
+"scripts": { "prepare": "node -e \"eval(1)\"" }

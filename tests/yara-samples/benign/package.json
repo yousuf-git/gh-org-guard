@@ -1,0 +1,4 @@
+{
+  "name": "y",
+  "scripts": { "postinstall": "husky install", "build": "vite build" }
+}

